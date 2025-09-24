@@ -8,7 +8,7 @@ from io import BytesIO
 st.set_page_config(page_title="Planning GP (22/09 → 04/12)", layout="wide")
 
 st.title("📅 Générateur d'emplois du temps par GP (22/09/2025 → 04/12/2025)")
-st.caption("Format compatible avec l'excel fourni : organisation hebdomadaire, jours en français, créneaux : 8h30-10h30, 10h45-12h45, 13h45-15h45, 16h-18h.")
+st.caption("Saisie/édition des créneaux, aperçu, export Excel multi-feuilles (une feuille par GP). Jours en français, créneaux fixes : 8h30-10h30, 10h45-12h45, 13h45-15h45, 16h-18h.")
 
 # ---------- Données initiales ----------
 RAW = [
@@ -158,6 +158,9 @@ RAW = [
 ("04/12/2025","Communication cellulaire et signalisation TD2 GP11","16h","18h"),
 ]
 
+SLOTS = ["8h30 - 10h30", "10h45 - 12h45", "13h45 - 15h45", "16h - 18h"]
+SLOT_KEYS = [("8h30","10h30"), ("10h45","12h45"), ("13h45","15h45"), ("16h","18h")]
+
 def normalize_gp(text: str) -> str:
     import re
     return re.sub(r'\\bG(\\d{1,2})\\b', r'GP\\1', text)
@@ -178,73 +181,114 @@ def build_gp_dict(rows):
 def fr_week_start(d):
     return d - timedelta(days=d.weekday())
 
+# ---------- Excel builder with fallback ----------
 def make_excel(gp_courses: dict, start_range: datetime, end_range: datetime) -> BytesIO:
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
-    from openpyxl.utils import get_column_letter
+    # Try openpyxl first (preferred), fallback to xlsxwriter if missing
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+        from openpyxl.utils import get_column_letter
 
-    time_slots = ["8h30 - 10h30", "10h45 - 12h45", "13h45 - 15h45", "16h - 18h"]
-    slot_keys = [("8h30","10h30"), ("10h45","12h45"), ("13h45","15h45"), ("16h","18h")]
+        wb = Workbook()
+        wb.remove(wb.active)
 
-    wb = Workbook()
-    wb.remove(wb.active)
+        thin = Side(style='thin', color='000000')
+        border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
+        header_fill = PatternFill(start_color="E6F1FF", end_color="E6F1FF", fill_type="solid")
+        slot_fill = PatternFill(start_color="F7F7F7", end_color="F7F7F7", fill_type="solid")
 
-    thin = Side(style='thin', color='000000')
-    border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
-    header_fill = PatternFill(start_color="E6F1FF", end_color="E6F1FF", fill_type="solid")
-    slot_fill = PatternFill(start_color="F7F7F7", end_color="F7F7F7", fill_type="solid")
+        for gp_num in range(1, 13):
+            gp = f"GP{gp_num}"
+            ws = wb.create_sheet(title=gp)
+            ws.append(["Semaine du :", "Heure", "Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"])
 
-    for gp_num in range(1, 13):
-        gp = f"GP{gp_num}"
-        ws = wb.create_sheet(title=gp)
+            for col in range(1, 10):
+                cell = ws.cell(row=1, column=col)
+                cell.font = Font(bold=True)
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.border = border_all
 
-        ws.append(["Semaine du :", "Heure", "Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"])
-        for col in range(1, 10):
-            cell = ws.cell(row=1, column=col)
-            cell.font = Font(bold=True)
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            cell.border = border_all
+            cur = fr_week_start(start_range)
+            while cur <= end_range:
+                for si, slot in enumerate(SLOTS):
+                    row = [cur.strftime("%Y-%m-%d") if si==0 else None, slot] + [None]*7
+                    ws.append(row)
+                    r = ws.max_row
+                    for c in range(1, 10):
+                        cell = ws.cell(row=r, column=c)
+                        if c==2:
+                            cell.fill = slot_fill
+                        cell.alignment = Alignment(horizontal="center" if c==2 else "left", vertical="center")
+                        cell.border = border_all
 
-        cur = fr_week_start(start_range)
-        while cur <= end_range:
-            # 4 rows per week (one by slot)
-            for si, slot in enumerate(time_slots):
-                row = [cur.strftime("%Y-%m-%d") if si==0 else None, slot] + [None]*7
-                ws.append(row)
-                r = ws.max_row
-                for c in range(1, 10):
-                    cell = ws.cell(row=r, column=c)
-                    if c==2:
-                        cell.fill = slot_fill
-                    cell.alignment = Alignment(horizontal="center" if c==2 else "left", vertical="center")
-                    cell.border = border_all
+                day_cols = {0:3,1:4,2:5,3:6,4:7,5:8,6:9}
+                base_row = ws.max_row-3
+                for dt, label, start, end in gp_courses.get(gp, []):
+                    if fr_week_start(dt)==cur:
+                        try:
+                            slot_index = SLOT_KEYS.index((start, end))
+                        except ValueError:
+                            slot_index = 0
+                        col = day_cols[dt.weekday()]
+                        r = base_row + slot_index
+                        cell = ws.cell(row=r, column=col)
+                        content = f"{label} ({start}-{end})"
+                        cell.value = (str(cell.value) + "\\n" + content) if cell.value else content
+                        cell.alignment = Alignment(wrap_text=True, vertical="top")
+                cur += timedelta(days=7)
 
-            # Fill courses
-            day_cols = {0:3,1:4,2:5,3:6,4:7,5:8,6:9}
-            base_row = ws.max_row-3
-            for dt, label, start, end in gp_courses.get(gp, []):
-                if fr_week_start(dt)==cur:
-                    try:
-                        slot_index = slot_keys.index((start, end))
-                    except ValueError:
-                        slot_index = 0
-                    col = day_cols[dt.weekday()]
-                    r = base_row + slot_index
-                    cell = ws.cell(row=r, column=col)
-                    content = f"{label} ({start}-{end})"
-                    cell.value = (str(cell.value) + "\\n" + content) if cell.value else content
-                    cell.alignment = Alignment(wrap_text=True, vertical="top")
-            cur += timedelta(days=7)
+            widths = [14, 14, 22, 22, 22, 22, 22, 22, 22]
+            from openpyxl.utils import get_column_letter
+            for i, w in enumerate(widths, start=1):
+                ws.column_dimensions[get_column_letter(i)].width = w
 
-        widths = [14, 14, 22, 22, 22, 22, 22, 22, 22]
-        for i, w in enumerate(widths, start=1):
-            ws.column_dimensions[get_column_letter(i)].width = w
+        bio = BytesIO()
+        wb.save(bio)
+        bio.seek(0)
+        return bio
+    except ModuleNotFoundError:
+        import xlsxwriter  # ensure installed via requirements
+        bio = BytesIO()
+        wb = xlsxwriter.Workbook(bio, {'in_memory': True})
+        header_fmt = wb.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter', 'bg_color': '#E6F1FF', 'border':1})
+        slot_fmt = wb.add_format({'align': 'center', 'valign': 'vcenter', 'bg_color': '#F7F7F7', 'border':1})
+        cell_fmt = wb.add_format({'text_wrap': True, 'valign': 'top', 'border':1})
 
-    bio = BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    return bio
+        for gp_num in range(1, 13):
+            gp = f"GP{gp_num}"
+            ws = wb.add_worksheet(gp)
+            headers = ["Semaine du :", "Heure", "Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+            for c, h in enumerate(headers):
+                ws.write(0, c, h, header_fmt)
+                ws.set_column(c, c, 22 if c>=2 else 14)
+            row_idx = 1
+            cur = fr_week_start(start_range)
+            while cur <= end_range:
+                base_row = row_idx
+                for si, slot in enumerate(SLOTS):
+                    ws.write(row_idx, 0, cur.strftime("%Y-%m-%d") if si==0 else "", cell_fmt)
+                    ws.write(row_idx, 1, slot, slot_fmt)
+                    for c in range(2, 9+1):
+                        ws.write(row_idx, c, "", cell_fmt)
+                    row_idx += 1
+                day_cols = {0:2,1:3,2:4,3:5,4:6,5:7,6:8}
+                for dt, label, start, end in gp_courses.get(gp, []):
+                    if fr_week_start(dt)==cur:
+                        try:
+                            slot_index = SLOT_KEYS.index((start, end))
+                        except ValueError:
+                            slot_index = 0
+                        col = day_cols[dt.weekday()]
+                        r = base_row + slot_index
+                        prev = ws.table.get((r, col), {}).get('string', "") if hasattr(ws, 'table') else ""
+                        content = f"{label} ({start}-{end})"
+                        ws.write(r, col, content, cell_fmt)
+                cur += timedelta(days=7)
+
+        wb.close()
+        bio.seek(0)
+        return bio
 
 # ---------- State & UI ----------
 if "rows" not in st.session_state:
@@ -274,12 +318,36 @@ st.subheader("📜 Aperçu des cours saisis")
 preview = pd.DataFrame(st.session_state.rows, columns=["Date","Intitulé","Début","Fin"])
 st.dataframe(preview, use_container_width=True, hide_index=True)
 
+# Petit aperçu hebdo d'un GP (affichage à l'écran)
+st.divider()
+st.subheader("👀 Aperçu hebdomadaire à l'écran (sélection GP + semaine)")
+gp_choice = st.selectbox("Groupe (GP)", [f"GP{i}" for i in range(1,13)], index=0)
+week_start = st.date_input("Lundi de la semaine", value=datetime(2025,9,22))
+week_start = datetime(week_start.year, week_start.month, week_start.day)
+week_days = [week_start + timedelta(days=i) for i in range(7)]
+cols = ["Heure"] + ["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi","Dimanche"]
+grid = pd.DataFrame({"Heure": SLOTS})
+for i, day in enumerate(["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi","Dimanche"], start=0):
+    grid[day] = ""
+
+gp_dict = build_gp_dict(st.session_state.rows)
+for dt, label, s, e in gp_dict.get(gp_choice, []):
+    if fr_week_start(dt) == fr_week_start(week_start):
+        try:
+            idx = SLOT_KEYS.index((s,e))
+        except ValueError:
+            idx = 0
+        weekday = dt.weekday()  # 0=Mon
+        day_name = ["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi","Dimanche"][weekday]
+        content = f"{label} ({s}-{e})"
+        grid.loc[idx, day_name] = (grid.loc[idx, day_name] + "\\n" if grid.loc[idx, day_name] else "") + content
+
+st.dataframe(grid, use_container_width=True, hide_index=True)
+
 st.divider()
 st.subheader("📤 Générer l'Excel par GP")
 start_date = datetime(2025,9,22)
 end_date = datetime(2025,12,4)
-
-gp_dict = build_gp_dict(st.session_state.rows)
 excel_bytes = make_excel(gp_dict, start_date, end_date)
 
 st.download_button(
@@ -289,4 +357,4 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-st.info("Astuce : déployez ce script sur **Streamlit Community Cloud**. Déposez `app.py` et `requirements.txt` dans un repo GitHub, puis créez une application Streamlit en pointant dessus.")
+st.info("💡 Déploiement Streamlit Cloud : créez un repo GitHub avec `app.py` et `requirements.txt`, puis lancez une app Streamlit en pointant dessus.")
